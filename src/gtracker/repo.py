@@ -9,7 +9,7 @@ import subprocess
 import time
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 
@@ -304,15 +304,35 @@ class Repo:
             for key, _, value in (row.partition("\n"),)
         )
 
-    def branches(self) -> tuple[Branch, ...]:
+    def branches(
+        self,
+        names: tuple[str, ...] = (),
+        *,
+        history: bool = True,
+        require_valid_upstreams: bool = False,
+    ) -> tuple[Branch, ...]:
         fmt = (
-            "%(refname)%09%(objectname)%09%(upstream)%09"
-            "%(upstream:remotename)%09%(upstream:remoteref)"
+            "%(refname)%00%(objectname)%00%(upstream)%00"
+            "%(upstream:remotename)%00%(upstream:remoteref)%00"
         )
         output = self.git("for-each-ref", f"--format={fmt}", "refs/heads/").stdout
+        rows = {
+            row.split("\0", 1)[0].removeprefix("refs/heads/"): row
+            for row in output.split("\0\n")
+            if row
+        }
+        unknown = frozenset(names) - rows.keys()
+        if unknown:
+            raise GitError(f"Unknown local branches: {', '.join(sorted(unknown))}")
+        selected = tuple(dict.fromkeys(names)) if names else tuple(rows)
         config = self.config_values(r"^branch\..*\.(remote|merge)$")
         remotes = frozenset(self.git("remote").stdout.splitlines())
-        return tuple(self._branch(row, config, remotes) for row in output.split("\n") if row)
+        branches = tuple(self._branch(rows[name], config, remotes) for name in selected)
+        if require_valid_upstreams:
+            for branch in branches:
+                if branch.upstream_error:
+                    raise GitError(f"Invalid upstream for {branch.name}: {branch.upstream_error}")
+        return tuple(self._resolve_branch(branch, history) for branch in branches)
 
     def _upstream_error(
         self,
@@ -348,33 +368,26 @@ class Repo:
         config: tuple[tuple[str, str], ...],
         remotes: frozenset[str],
     ) -> Branch:
-        ref, oid, upstream, remote, remote_ref = row.split("\t")
+        ref, oid, upstream, remote, remote_ref = row.split("\0")
         name = ref.removeprefix("refs/heads/")
         error = self._upstream_error(name, upstream, remote, remote_ref, config, remotes)
-        target = self.oid(upstream) if upstream and not error else None
+        return Branch(name, ref, oid, upstream, remote, remote_ref, None, upstream_error=error)
+
+    def _resolve_branch(self, branch: Branch, history: bool) -> Branch:
+        if branch.upstream_error or not branch.upstream:
+            return branch
+        target = self.oid(branch.upstream)
         counts = (
-            self.git("rev-list", "--left-right", "--count", f"{oid}...{target}").stdout.split()
-            if target
+            self.git(
+                "rev-list", "--left-right", "--count", f"{branch.oid}...{target}"
+            ).stdout.split()
+            if history and target and branch.oid != target
             else ("0", "0")
         )
-        return Branch(
-            name,
-            ref,
-            oid,
-            upstream,
-            remote,
-            remote_ref,
-            target,
-            int(counts[0]),
-            int(counts[1]),
-            error,
-        )
+        return replace(branch, upstream_oid=target, ahead=int(counts[0]), behind=int(counts[1]))
 
     def branch(self, name: str) -> Branch:
-        found = next((branch for branch in self.branches() if branch.name == name), None)
-        if found is None:
-            raise GitError(f"Unknown local branch: {name}")
-        return found
+        return self.branches((name,))[0]
 
     def operation(self) -> str | None:
         names = (

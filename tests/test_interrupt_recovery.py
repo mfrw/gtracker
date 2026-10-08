@@ -235,18 +235,29 @@ def test_invalid_implicit_upstream_is_rejected_before_fetch(sandbox: Sandbox) ->
     assert sandbox.git("rev-parse", "origin/main").stdout.strip() == previous
 
 
+@pytest.mark.parametrize("misconfiguration", ["missing-remote", "tab-merge", "newline-merge"])
 def test_explicit_pull_overrides_malformed_configuration_without_rewriting_it(
     sandbox: Sandbox,
+    misconfiguration: str,
 ) -> None:
-    sandbox.git("config", "--unset", "branch.main.remote")
+    if misconfiguration == "missing-remote":
+        sandbox.git("config", "--unset", "branch.main.remote")
+    else:
+        separator = "\t" if misconfiguration == "tab-merge" else "\n"
+        sandbox.git("config", "branch.main.merge", f"refs/heads/bad{separator}name")
+    before = sandbox.git(
+        "config", "--null", "--get-regexp", r"^branch\.main\.(remote|merge)$"
+    ).stdout
     sandbox.commit("local.txt", "local\n")
     target = sandbox.commit("upstream.txt", "upstream\n", path=sandbox.remote)
 
     pull_rebase(Repo.open(sandbox.repo), "origin/main")
 
     sandbox.git("merge-base", "--is-ancestor", target, "HEAD")
-    assert sandbox.git("config", "--get", "branch.main.remote", check=False).returncode == 1
-    assert sandbox.git("config", "--get", "branch.main.merge").stdout.strip() == "refs/heads/main"
+    assert (
+        sandbox.git("config", "--null", "--get-regexp", r"^branch\.main\.(remote|merge)$").stdout
+        == before
+    )
 
 
 def test_batch_does_not_integrate_cached_ref_of_skipped_remote(sandbox: Sandbox) -> None:

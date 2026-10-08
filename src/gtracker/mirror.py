@@ -174,18 +174,13 @@ def _mirror_branch(repo: Repo, branch: Branch, fetched: FetchReport, dry_run: bo
 def sync_mirror(
     repo: Repo, names: tuple[str, ...] = (), dry_run: bool = False
 ) -> tuple[Result, ...]:
-    available = repo.branches()
-    unknown = frozenset(names) - frozenset(branch.name for branch in available)
-    if unknown:
-        raise GitError(f"Unknown local branches: {', '.join(sorted(unknown))}")
+    available = repo.branches(names, history=False, require_valid_upstreams=True)
     for branch in available:
-        if branch.upstream_error and (not names or branch.name in names):
-            raise GitError(f"Invalid upstream for {branch.name}: {branch.upstream_error}")
-        if branch.upstream and (not names or branch.name in names):
+        if branch.upstream:
             _require_direct(repo, branch)
     repo.ensure_no_operations()
     fetched = repo.fetch_all()
-    selected = tuple(branch for branch in repo.branches() if not names or branch.name in names)
+    selected = repo.branches(names, history=False, require_valid_upstreams=True)
     # A branch that changed while fetching must not be overwritten.
     before = {branch.ref: branch.oid for branch in available}
     for branch in selected:

@@ -34,6 +34,23 @@ def test_non_utf8_ignored_filename_is_preserved_without_decode_crash(sandbox: Sa
         assert handle.read() == b"private build contents"
 
 
+def _unavailable_promisor(
+    sandbox: Sandbox, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, oid: str
+) -> Path:
+    object_path = sandbox.repo / ".git" / "objects" / oid[:2] / oid[2:]
+    object_path.unlink()
+    marker = tmp_path / "transport-used"
+    helper = tmp_path / "git-remote-audit"
+    helper.write_text(f"#!/bin/sh\nprintf attempted >> '{marker}'\nexit 1\n")
+    helper.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file:audit")
+    sandbox.git("config", "remote.origin.url", "audit::missing")
+    sandbox.git("config", "remote.origin.promisor", "true")
+    sandbox.git("config", "remote.origin.partialclonefilter", "blob:none")
+    return marker
+
+
 @pytest.mark.parametrize("command", ["status", "backups"])
 def test_read_only_commands_do_not_lazy_fetch_missing_promisor_objects(
     sandbox: Sandbox,
@@ -46,18 +63,31 @@ def test_read_only_commands_do_not_lazy_fetch_missing_promisor_objects(
     backup = "refs/gtracker/backups/manual/main"
     if command == "backups":
         sandbox.git("update-ref", backup, target)
-    object_path = sandbox.repo / ".git" / "objects" / target[:2] / target[2:]
-    object_path.unlink()
-    marker = tmp_path / "transport-used"
-    helper = tmp_path / "git-remote-audit"
-    helper.write_text(f"#!/bin/sh\nprintf attempted >> '{marker}'\nexit 1\n")
-    helper.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
-    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file:audit")
-    sandbox.git("config", "remote.origin.url", "audit::missing")
-    sandbox.git("config", "remote.origin.promisor", "true")
-    sandbox.git("config", "remote.origin.partialclonefilter", "blob:none")
+    marker = _unavailable_promisor(sandbox, tmp_path, monkeypatch, target)
     result = sandbox.cli(command)
     assert not marker.exists()
     assert result.returncode != 0
     assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize("command", [("sync",), ("sync", "--strategy", "rebase")])
+def test_malformed_selected_upstream_prevents_implicit_promisor_fetch(
+    sandbox: Sandbox,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: tuple[str, ...],
+) -> None:
+    original = sandbox.git("rev-parse", "HEAD").stdout.strip()
+    target = sandbox.commit("upstream.txt", "new remote", path=sandbox.remote)
+    sandbox.git("fetch", "origin")
+    sandbox.git("branch", "malformed", "main")
+    sandbox.git("config", "branch.malformed.remote", "missing")
+    sandbox.git("config", "branch.malformed.merge", "refs/heads/main")
+    marker = _unavailable_promisor(sandbox, tmp_path, monkeypatch, target)
+
+    result = sandbox.cli(*command)
+
+    assert not marker.exists()
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "upstream" in (result.stdout + result.stderr).lower()
+    assert sandbox.git("rev-parse", "HEAD").stdout.strip() == original

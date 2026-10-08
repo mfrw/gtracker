@@ -48,17 +48,12 @@ def parser() -> argparse.ArgumentParser:
 
 
 def show_status(repo: Repo, names: tuple[str, ...]) -> int:
-    branches = repo.branches()
-    unknown = frozenset(names) - frozenset(branch.name for branch in branches)
-    if unknown:
-        raise GitError(f"Unknown local branches: {', '.join(sorted(unknown))}")
+    branches = repo.branches(names)
     current = repo.current_branch()
     trees = {tree.branch: tree for tree in repo.worktrees() if tree.branch}
     print("Last-fetched state; no network access or branch updates.")
     print("BRANCH\tUPSTREAM\tAHEAD\tBEHIND\tSTATE")
     for branch in branches:
-        if names and branch.name not in names:
-            continue
         if branch.upstream_error:
             state = f"invalid-upstream; {branch.upstream_error}"
         elif not branch.upstream:
@@ -81,9 +76,7 @@ def show_status(repo: Repo, names: tuple[str, ...]) -> int:
         prefix = "*" if branch.ref == current else " "
         upstream = branch.upstream.removeprefix("refs/remotes/") or "-"
         print(f"{prefix}{branch.name}\t{upstream}\t{branch.ahead}\t{branch.behind}\t{state}")
-    return int(
-        any(branch.upstream_error for branch in branches if not names or branch.name in names)
-    )
+    return int(any(branch.upstream_error for branch in branches))
 
 
 def show_results(results: tuple[Result, ...]) -> int:

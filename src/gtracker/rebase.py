@@ -272,7 +272,7 @@ def pull_rebase(repo: Repo, upstream: str | None = None, dry_run: bool = False) 
         if current is None:
             raise GitError("Pull with rebase requires a current local branch, not detached HEAD")
         name = current.removeprefix("refs/heads/")
-        branch = repo.branch(name)
+        branch = repo.branches((name,), history=False, require_valid_upstreams=upstream is None)[0]
         _validate_branch(repo, branch)
         source = _upstream(repo, branch, upstream)
         if source.old_oid is None:
@@ -303,15 +303,8 @@ def pull_rebase(repo: Repo, upstream: str | None = None, dry_run: bool = False) 
 
 
 def _select(repo: Repo, names: tuple[str, ...]) -> tuple[_Plan, ...]:
-    branches = repo.branches()
-    if names:
-        known = {branch.name: branch for branch in branches}
-        unknown = next((name for name in names if name not in known), None)
-        if unknown is not None:
-            raise GitError(f"Unknown local branch: {unknown}")
-        selected = tuple(known[name] for name in dict.fromkeys(names))
-    else:
-        selected = tuple(branch for branch in branches if branch.upstream or branch.upstream_error)
+    branches = repo.branches(names, history=False, require_valid_upstreams=True)
+    selected = branches if names else tuple(branch for branch in branches if branch.upstream)
     for branch in selected:
         _validate_branch(repo, branch)
     return tuple(_Plan(branch, _upstream(repo, branch)) for branch in selected)
