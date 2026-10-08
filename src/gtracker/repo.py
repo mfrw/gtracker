@@ -28,6 +28,7 @@ class Branch:
     upstream_oid: str | None
     ahead: int = 0
     behind: int = 0
+    upstream_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -309,18 +310,55 @@ class Repo:
             "%(upstream:remotename)%09%(upstream:remoteref)"
         )
         output = self.git("for-each-ref", f"--format={fmt}", "refs/heads/").stdout
-        return tuple(self._branch(row) for row in output.split("\n") if row)
+        config = self.config_values(r"^branch\..*\.(remote|merge)$")
+        remotes = frozenset(self.git("remote").stdout.splitlines())
+        return tuple(self._branch(row, config, remotes) for row in output.split("\n") if row)
 
-    def _branch(self, row: str) -> Branch:
+    def _upstream_error(
+        self,
+        name: str,
+        upstream: str,
+        remote: str,
+        remote_ref: str,
+        config: tuple[tuple[str, str], ...],
+        remotes: frozenset[str],
+    ) -> str:
+        configured = tuple(value for key, value in config if key == f"branch.{name}.remote")
+        merges = tuple(value for key, value in config if key == f"branch.{name}.merge")
+        if not configured and not merges:
+            return ""
+        if len(configured) != 1 or not configured[0]:
+            return "upstream requires exactly one configured branch remote"
+        if len(merges) != 1 or not merges[0]:
+            return "upstream requires exactly one configured merge branch"
+        if configured[0] != "." and configured[0] not in remotes:
+            return f"unknown configured upstream remote: {configured[0]}"
+        if (
+            not merges[0].startswith("refs/heads/")
+            or self.git("check-ref-format", merges[0], check=False).returncode
+        ):
+            return f"invalid configured upstream branch: {merges[0]}"
+        if not upstream or remote != configured[0] or remote_ref != merges[0]:
+            return "cannot resolve configured upstream; check the remote fetch mapping"
+        return ""
+
+    def _branch(
+        self,
+        row: str,
+        config: tuple[tuple[str, str], ...],
+        remotes: frozenset[str],
+    ) -> Branch:
         ref, oid, upstream, remote, remote_ref = row.split("\t")
-        target = self.oid(upstream) if upstream else None
+        name = ref.removeprefix("refs/heads/")
+        error = self._upstream_error(name, upstream, remote, remote_ref, config, remotes)
+        target = self.oid(upstream) if upstream and not error else None
         counts = (
             self.git("rev-list", "--left-right", "--count", f"{oid}...{target}").stdout.split()
             if target
             else ("0", "0")
         )
         return Branch(
-            ref.removeprefix("refs/heads/"),
+            name,
             ref,
             oid,
             upstream,
@@ -329,6 +367,7 @@ class Repo:
             target,
             int(counts[0]),
             int(counts[1]),
+            error,
         )
 
     def branch(self, name: str) -> Branch:

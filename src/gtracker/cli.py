@@ -47,7 +47,7 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-def show_status(repo: Repo, names: tuple[str, ...]) -> None:
+def show_status(repo: Repo, names: tuple[str, ...]) -> int:
     branches = repo.branches()
     unknown = frozenset(names) - frozenset(branch.name for branch in branches)
     if unknown:
@@ -59,7 +59,9 @@ def show_status(repo: Repo, names: tuple[str, ...]) -> None:
     for branch in branches:
         if names and branch.name not in names:
             continue
-        if not branch.upstream:
+        if branch.upstream_error:
+            state = f"invalid-upstream; {branch.upstream_error}"
+        elif not branch.upstream:
             state = "local-only"
         elif branch.upstream_oid is None:
             state = "missing-upstream"
@@ -79,6 +81,9 @@ def show_status(repo: Repo, names: tuple[str, ...]) -> None:
         prefix = "*" if branch.ref == current else " "
         upstream = branch.upstream.removeprefix("refs/remotes/") or "-"
         print(f"{prefix}{branch.name}\t{upstream}\t{branch.ahead}\t{branch.behind}\t{state}")
+    return int(
+        any(branch.upstream_error for branch in branches if not names or branch.name in names)
+    )
 
 
 def show_results(results: tuple[Result, ...]) -> int:
@@ -98,8 +103,7 @@ def show_results(results: tuple[Result, ...]) -> int:
 
 def execute(args: argparse.Namespace, repo: Repo) -> int:
     if args.command == "status":
-        show_status(repo, tuple(args.branch))
-        return 0
+        return show_status(repo, tuple(args.branch))
     if args.command == "backups":
         saved = list_backups(repo)
         if not saved:

@@ -142,6 +142,8 @@ def _replace(repo: Repo, branch: Branch, target: str, *, save: bool, reason: str
 
 
 def _mirror_branch(repo: Repo, branch: Branch, fetched: FetchReport, dry_run: bool) -> Result:
+    if branch.upstream_error:
+        raise GitError(f"Invalid upstream for {branch.name}: {branch.upstream_error}")
     if not branch.upstream:
         return Result(branch.name, "skipped-local", "no configured upstream")
     target = (
@@ -177,6 +179,8 @@ def sync_mirror(
     if unknown:
         raise GitError(f"Unknown local branches: {', '.join(sorted(unknown))}")
     for branch in available:
+        if branch.upstream_error and (not names or branch.name in names):
+            raise GitError(f"Invalid upstream for {branch.name}: {branch.upstream_error}")
         if branch.upstream and (not names or branch.name in names):
             _require_direct(repo, branch)
     repo.ensure_no_operations()

@@ -113,6 +113,8 @@ def _upstream(repo: Repo, branch: Branch, explicit: str | None = None) -> _Upstr
         if repo.oid(tracking_ref) is None:
             raise GitError(f"Unknown upstream: {explicit}; fetch its tracking ref first")
     else:
+        if branch.upstream_error:
+            raise GitError(f"Invalid upstream for {branch.name}: {branch.upstream_error}")
         if not branch.upstream:
             raise GitError(f"Branch {branch.name} has no configured upstream")
         remote, remote_ref, tracking_ref = branch.remote, branch.remote_ref, branch.upstream
@@ -309,7 +311,7 @@ def _select(repo: Repo, names: tuple[str, ...]) -> tuple[_Plan, ...]:
             raise GitError(f"Unknown local branch: {unknown}")
         selected = tuple(known[name] for name in dict.fromkeys(names))
     else:
-        selected = tuple(branch for branch in branches if branch.upstream)
+        selected = tuple(branch for branch in branches if branch.upstream or branch.upstream_error)
     for branch in selected:
         _validate_branch(repo, branch)
     return tuple(_Plan(branch, _upstream(repo, branch)) for branch in selected)
