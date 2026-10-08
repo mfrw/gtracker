@@ -13,6 +13,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from .compat import git_version_error
+
 
 class GitError(RuntimeError):
     """An unsafe operation or failed Git command."""
@@ -200,6 +202,9 @@ class Repo:
     @classmethod
     def open(cls, path: str | Path, *, offline: bool = False) -> Repo:
         candidate = cls(Path(path).expanduser().resolve(), offline)
+        version_error = git_version_error(candidate.git("--version").stdout)
+        if version_error:
+            raise GitError(version_error)
         if candidate.git("rev-parse", "--is-bare-repository").stdout.strip() == "true":
             raise GitError("gtracker requires a non-bare repository")
         root = candidate.git("rev-parse", "--show-toplevel").stdout.removesuffix("\n")

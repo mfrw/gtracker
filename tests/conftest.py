@@ -44,6 +44,12 @@ def isolated_git(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     for key in tuple(os.environ):
         if key.startswith("GIT_"):
             monkeypatch.delenv(key)
+    home = tmp_path / "home"
+    config = tmp_path / "xdg-config"
+    home.mkdir()
+    config.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
     monkeypatch.setenv("GIT_AUTHOR_NAME", "Test User")
