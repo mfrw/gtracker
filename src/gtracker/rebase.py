@@ -284,7 +284,15 @@ def pull_rebase(repo: Repo, upstream: str | None = None, dry_run: bool = False) 
             raise GitError(f"Worktree is locked: {repo.path}")
         # Capture the replay boundary above, before Git updates the tracking ref.
         # Pin FETCH_HEAD so a remote rewrite cannot change the checked target again.
-        repo.git("fetch", "--prune", "--", source.remote, source.remote_ref)
+        repo.git(
+            "fetch",
+            "--prune",
+            "--progress",
+            "--",
+            source.remote,
+            source.remote_ref,
+            progress=True,
+        )
         target = repo.oid("FETCH_HEAD")
         if target is None:
             raise GitError(f"No fetched upstream commit for {branch.name}")

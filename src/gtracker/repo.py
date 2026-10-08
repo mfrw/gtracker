@@ -6,6 +6,7 @@ import os
 import signal
 import stat
 import subprocess
+import sys
 import time
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -209,6 +210,7 @@ class Repo:
         *args: str,
         check: bool = True,
         input: str | None = None,
+        progress: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         env = {
             key: value
@@ -230,7 +232,7 @@ class Repo:
                 ["git", "--no-pager", "-c", "submodule.recurse=false", "-C", str(self.path), *args],
                 stdin=subprocess.PIPE if input is not None else None,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=None if progress else subprocess.PIPE,
                 env=env,
                 process_group=0,
             ) as process:
@@ -476,13 +478,26 @@ class Repo:
         ):
             raise GitError(f"Fetch destination dereferences outside safe namespaces: {ref}")
 
-    def _fetch_remote(self, remote: str) -> tuple[FetchedRef, ...]:
-        result = self.git("fetch", "--no-all", "--prune", "--porcelain", "--verbose", "--", remote)
-        return tuple(
+    def _fetch_remote(self, remote: str, index: int, total: int) -> tuple[FetchedRef, ...]:
+        print(f"[{index}/{total}] Fetching {remote}...", file=sys.stderr, flush=True)
+        result = self.git(
+            "fetch",
+            "--no-all",
+            "--prune",
+            "--porcelain",
+            "--verbose",
+            "--progress",
+            "--",
+            remote,
+            progress=True,
+        )
+        refs = tuple(
             ref
             for row in result.stdout.splitlines()
             if (ref := FetchedRef.parse(remote, row)) is not None
         )
+        print(f"[{index}/{total}] Fetched {remote}.", file=sys.stderr, flush=True)
+        return refs
 
     def fetch_all(self) -> FetchReport:
         try:
@@ -495,7 +510,15 @@ class Repo:
                 )
             }
             selected = tuple(remote for remote in remotes if not skipped.get(remote, False))
-            fetched = tuple(self._fetch_remote(remote) for remote in selected)
+            for remote in remotes:
+                if skipped.get(remote, False):
+                    print(
+                        f"Skipping {remote}: configured not to fetch.", file=sys.stderr, flush=True
+                    )
+            fetched = tuple(
+                self._fetch_remote(remote, index, len(selected))
+                for index, remote in enumerate(selected, 1)
+            )
             return FetchReport(frozenset(selected), tuple(ref for refs in fetched for ref in refs))
         except KeyboardInterrupt as exc:
             detail = f"\n{exc}" if str(exc) else ""

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections import Counter
 from importlib.metadata import version
 
 from gtracker.mirror import list_backups, restore, sync_mirror
@@ -79,19 +80,43 @@ def show_status(repo: Repo, names: tuple[str, ...]) -> int:
     return int(any(branch.upstream_error for branch in branches))
 
 
-def show_results(results: tuple[Result, ...]) -> int:
+def _result_category(result: Result) -> str:
+    if result.action in {"mirrored", "rebased", "restored"}:
+        return "updated"
+    if result.action == "unchanged":
+        return "unchanged"
+    if result.action.startswith("skipped"):
+        return "skipped"
+    if result.action.startswith("would-"):
+        return "previewed"
+    return "failed"
+
+
+def show_results(
+    results: tuple[Result, ...], *, outcome: str = "completed", dry_run: bool = False
+) -> int:
     for result in results:
         print(
             f"{result.branch}: {result.action}" + (f" — {result.detail}" if result.detail else "")
         )
         if result.backup:
             print(f"  backup: {result.backup}")
-    return int(
-        any(
-            result.action in {"skipped", "skipped-missing", "skipped-unfetched", "failed"}
-            for result in results
-        )
+    categories = tuple(_result_category(result) for result in results)
+    stopped = outcome in {"failed", "interrupted"}
+    terminal_failure = ("failed",) if stopped and "failed" not in categories else ()
+    counts = Counter((*categories, *terminal_failure))
+    warning = bool(counts["failed"]) or any(
+        category == "skipped" and result.action != "skipped-local"
+        for result, category in zip(results, categories, strict=True)
     )
+    preview = dry_run or bool(counts["previewed"])
+    label = outcome if stopped else "preview" if preview else "completed"
+    if warning and not stopped:
+        label += " with warnings"
+    labels = ("updated", "unchanged", "skipped", "failed") + (("previewed",) if preview else ())
+    totals = ", ".join(f"{counts[category]} {category}" for category in labels)
+    print(f"\nSummary ({label}): {totals}", flush=True)
+    return int(warning)
 
 
 def execute(args: argparse.Namespace, repo: Repo) -> int:
@@ -106,17 +131,20 @@ def execute(args: argparse.Namespace, repo: Repo) -> int:
         return 0
     with locked(repo):
         if args.command == "restore":
-            return show_results((restore(repo, args.backup, args.branch, args.dry_run),))
+            return show_results(
+                (restore(repo, args.backup, args.branch, args.dry_run),), dry_run=args.dry_run
+            )
         if args.dry_run:
             print(
-                "Dry run: fetching updates remote-tracking refs; local branches remain unchanged."
+                "Dry run: fetching updates remote-tracking refs; local branches remain unchanged.",
+                flush=True,
             )
-        else:
-            print("Fetching upstreams...", flush=True)
         if args.command == "pull":
-            return show_results((pull_rebase(repo, args.upstream, args.dry_run),))
+            return show_results(
+                (pull_rebase(repo, args.upstream, args.dry_run),), dry_run=args.dry_run
+            )
         sync = sync_mirror if args.strategy == "mirror" else sync_rebase
-        return show_results(sync(repo, tuple(args.branch), args.dry_run))
+        return show_results(sync(repo, tuple(args.branch), args.dry_run), dry_run=args.dry_run)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -125,14 +153,24 @@ def main(argv: list[str] | None = None) -> int:
         repo = Repo.open(args.repo, offline=args.command in {"status", "backups"})
         return execute(args, repo)
     except UpdateInterrupted as exc:
-        show_results(exc.results)
-        print(f"gtracker: {exc}", file=sys.stderr)
+        show_results(exc.results, outcome="interrupted", dry_run=getattr(args, "dry_run", False))
+        print(f"gtracker: {exc}", file=sys.stderr, flush=True)
         return 130
     except (GitError, OSError) as exc:
         if isinstance(exc, (UpdateError, RebaseConflict)):
-            show_results(exc.results)
-        print(f"gtracker: {exc}", file=sys.stderr)
+            results = exc.results
+            if isinstance(exc, RebaseConflict) and not any(
+                result.branch == exc.branch and _result_category(result) == "failed"
+                for result in results
+            ):
+                results = (*results, Result(exc.branch, "failed", exc.detail, exc.backup))
+            show_results(results, outcome="failed", dry_run=getattr(args, "dry_run", False))
+        elif isinstance(exc, GitError) and args.command in {"sync", "pull", "restore"}:
+            show_results((), outcome="failed", dry_run=getattr(args, "dry_run", False))
+        print(f"gtracker: {exc}", file=sys.stderr, flush=True)
         return 1
     except KeyboardInterrupt:
-        print("gtracker: interrupted; inspect Git state before retrying", file=sys.stderr)
+        print(
+            "gtracker: interrupted; inspect Git state before retrying", file=sys.stderr, flush=True
+        )
         return 130
