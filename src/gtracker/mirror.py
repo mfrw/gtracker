@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from gtracker.repo import Branch, GitError, Repo, Result, UpdateError, Worktree
+from gtracker.repo import Branch, FetchReport, GitError, Repo, Result, UpdateError, Worktree
 
 BACKUP_PREFIX = "refs/gtracker/backups/"
 
@@ -105,23 +105,31 @@ def _replace(repo: Repo, branch: Branch, target: str, *, save: bool, reason: str
     return backup
 
 
-def _mirror_branch(repo: Repo, branch: Branch, dry_run: bool) -> Result:
+def _mirror_branch(repo: Repo, branch: Branch, fetched: FetchReport, dry_run: bool) -> Result:
     if not branch.upstream:
         return Result(branch.name, "skipped-local", "no configured upstream")
-    if branch.upstream_oid is None:
-        return Result(branch.name, "skipped-missing", f"upstream missing: {branch.upstream}")
-    if branch.oid == branch.upstream_oid:
+    target = (
+        branch.upstream_oid if branch.remote == "." else fetched.oid(branch.remote, branch.upstream)
+    )
+    if target is None:
+        if branch.upstream_oid is None:
+            return Result(branch.name, "skipped-missing", f"upstream missing: {branch.upstream}")
+        return Result(
+            branch.name, "skipped-unfetched", f"upstream was not fetched: {branch.upstream}"
+        )
+    if branch.oid == target:
         return Result(branch.name, "unchanged")
     _require_direct(repo, branch)
     try:
-        _checked_tree(repo, branch, branch.upstream_oid)
+        _checked_tree(repo, branch, target)
     except GitError as exc:
         return Result(branch.name, "skipped", str(exc))
-    detail = f"{branch.oid[:12]} -> {branch.upstream_oid[:12]} ({branch.upstream})"
+    ahead = int(repo.git("rev-list", "--count", f"{target}..{branch.oid}").stdout)
+    detail = f"{branch.oid[:12]} -> {target[:12]} ({branch.upstream})"
     if dry_run:
-        suffix = "; saves old tip before replacement" if branch.ahead else ""
+        suffix = "; saves old tip before replacement" if ahead else ""
         return Result(branch.name, "would-mirror", detail + suffix)
-    backup = _replace(repo, branch, branch.upstream_oid, save=branch.ahead > 0, reason="mirror")
+    backup = _replace(repo, branch, target, save=ahead > 0, reason="mirror")
     return Result(branch.name, "mirrored", detail, backup)
 
 
@@ -136,7 +144,7 @@ def sync_mirror(
         if branch.upstream and (not names or branch.name in names):
             _require_direct(repo, branch)
     repo.ensure_no_operations()
-    repo.fetch_all()
+    fetched = repo.fetch_all()
     selected = tuple(branch for branch in repo.branches() if not names or branch.name in names)
     # A branch that changed while fetching must not be overwritten.
     before = {branch.ref: branch.oid for branch in available}
@@ -146,7 +154,7 @@ def sync_mirror(
     results: tuple[Result, ...] = ()
     for branch in selected:
         try:
-            results = (*results, _mirror_branch(repo, branch, dry_run))
+            results = (*results, _mirror_branch(repo, branch, fetched, dry_run))
         except GitError as exc:
             raise UpdateError(f"Mirror stopped at {branch.name}: {exc}", results) from exc
     return results

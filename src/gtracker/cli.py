@@ -88,7 +88,12 @@ def show_results(results: tuple[Result, ...]) -> int:
         )
         if result.backup:
             print(f"  backup: {result.backup}")
-    return int(any(result.action in {"skipped", "skipped-missing", "failed"} for result in results))
+    return int(
+        any(
+            result.action in {"skipped", "skipped-missing", "skipped-unfetched", "failed"}
+            for result in results
+        )
+    )
 
 
 def execute(args: argparse.Namespace, repo: Repo) -> int:

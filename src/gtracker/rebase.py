@@ -331,19 +331,27 @@ def sync_rebase(
     original, original_oid = repo.current_branch(), repo.oid("HEAD")
     if original_oid is None:
         raise GitError("Sync with rebase requires an existing checkout commit")
-    repo.fetch_all()
+    fetched = repo.fetch_all()
     results: tuple[Result, ...] = ()
     try:
         for plan in plans:
             _guard_tip(repo, plan.branch)
-            target = repo.oid(plan.upstream.tracking_ref)
+            source = plan.upstream
+            target = (
+                repo.oid(source.tracking_ref)
+                if source.remote == "."
+                else fetched.oid(source.remote, source.tracking_ref)
+            )
             if target is None:
+                cached = repo.oid(source.tracking_ref)
+                action = "skipped-unfetched" if cached else "skipped-missing"
+                reason = "upstream not fetched" if cached else "missing upstream"
                 results = (
                     *results,
                     Result(
                         plan.branch.name,
-                        "skipped-missing",
-                        f"missing upstream: {plan.upstream.tracking_ref}",
+                        action,
+                        f"{reason}: {source.tracking_ref}",
                     ),
                 )
                 continue

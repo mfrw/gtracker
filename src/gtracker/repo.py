@@ -51,6 +51,31 @@ class UpdateError(GitError):
 
 
 @dataclass(frozen=True)
+class FetchedRef:
+    remote: str
+    ref: str
+    oid: str
+
+    @classmethod
+    def parse(cls, remote: str, row: str) -> FetchedRef | None:
+        fields = row[2:].split()
+        if len(fields) != 3 or row[0] not in " +-*t=":
+            raise GitError(f"Cannot interpret fetched refs from remote {remote}: {row}")
+        return cls(remote, fields[2], fields[1]) if row[0] != "-" else None
+
+
+@dataclass(frozen=True)
+class FetchReport:
+    remotes: frozenset[str]
+    refs: tuple[FetchedRef, ...]
+
+    def oid(self, remote: str, ref: str) -> str | None:
+        return next(
+            (item.oid for item in self.refs if item.remote == remote and item.ref == ref), None
+        )
+
+
+@dataclass(frozen=True)
 class Repo:
     path: Path
     offline: bool = False
@@ -139,6 +164,18 @@ class Repo:
             (row.removeprefix("branch ") for row in rows if row.startswith("branch ")), None
         )
         return Worktree(Path(path), branch, any(row.startswith("locked") for row in rows))
+
+    def config_values(self, pattern: str, *, boolean: bool = False) -> tuple[tuple[str, str], ...]:
+        options = ("--type=bool",) if boolean else ()
+        result = self.git("config", "--null", *options, "--get-regexp", pattern, check=False)
+        if result.returncode not in (0, 1):
+            raise GitError(result.stderr.strip() or "Cannot read Git configuration")
+        return tuple(
+            (key, value)
+            for row in result.stdout.split("\0")
+            if row
+            for key, _, value in (row.partition("\n"),)
+        )
 
     def branches(self) -> tuple[Branch, ...]:
         fmt = (
@@ -261,9 +298,26 @@ class Repo:
         ):
             raise GitError(f"Fetch destination dereferences outside safe namespaces: {ref}")
 
-    def fetch_all(self) -> None:
+    def _fetch_remote(self, remote: str) -> tuple[FetchedRef, ...]:
+        result = self.git("fetch", "--no-all", "--prune", "--porcelain", "--verbose", "--", remote)
+        return tuple(
+            ref
+            for row in result.stdout.splitlines()
+            if (ref := FetchedRef.parse(remote, row)) is not None
+        )
+
+    def fetch_all(self) -> FetchReport:
         self.ensure_safe_fetch()
-        self.git("fetch", "--all", "--prune")
+        remotes = tuple(self.git("remote").stdout.splitlines())
+        skipped = {
+            key.rsplit(".", 1)[0].removeprefix("remote."): value == "true"
+            for key, value in self.config_values(
+                r"^remote\..*\.(skipfetchall|skipdefaultupdate)$", boolean=True
+            )
+        }
+        selected = tuple(remote for remote in remotes if not skipped.get(remote, False))
+        fetched = tuple(self._fetch_remote(remote) for remote in selected)
+        return FetchReport(frozenset(selected), tuple(ref for refs in fetched for ref in refs))
 
 
 @contextmanager
