@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from collections import Counter
 from importlib.metadata import version
 
 from gtracker.mirror import list_backups, restore, sync_mirror
 from gtracker.rebase import RebaseConflict, pull_rebase, sync_rebase
-from gtracker.repo import GitError, Repo, Result, UpdateError, UpdateInterrupted, locked
+from gtracker.repo import Branch, GitError, Repo, Result, UpdateError, UpdateInterrupted, locked
 
 
 def parser() -> argparse.ArgumentParser:
@@ -48,36 +49,99 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
+def _status_state(branch: Branch) -> str:
+    if branch.upstream_error:
+        return "invalid-upstream"
+    if not branch.upstream:
+        return "local-only"
+    if branch.upstream_oid is None:
+        return "missing-upstream"
+    if branch.ahead and branch.behind:
+        return "diverged"
+    if branch.ahead:
+        return "ahead"
+    if branch.behind:
+        return "behind"
+    return "matching"
+
+
+def _status_cells(branch: Branch, state: str, marker: str) -> tuple[str, ...]:
+    counts_known = branch.upstream_oid is not None and not branch.upstream_error
+    return (
+        f"{marker} {branch.name}",
+        branch.upstream.removeprefix("refs/remotes/") or "-",
+        str(branch.ahead) if counts_known else "-",
+        str(branch.behind) if counts_known else "-",
+        state,
+    )
+
+
+def _status_columns(cells: tuple[str, ...], widths: tuple[int, ...]) -> str:
+    return (
+        "  "
+        + "  ".join(
+            cell.rjust(width) if index in (2, 3) else cell.ljust(width)
+            for index, (cell, width) in enumerate(zip(cells, widths, strict=True))
+        ).rstrip()
+    )
+
+
 def show_status(repo: Repo, names: tuple[str, ...]) -> int:
     branches = repo.branches(names)
     current = repo.current_branch()
     trees = {tree.branch: tree for tree in repo.worktrees() if tree.branch}
+    states = tuple(_status_state(branch) for branch in branches)
+    rows = tuple(
+        _status_cells(
+            branch,
+            state,
+            "*" if branch.ref == current else "+" if branch.ref in trees else " ",
+        )
+        for branch, state in zip(branches, states, strict=True)
+    )
+    headers = ("  BRANCH", "UPSTREAM", "AHEAD", "BEHIND", "STATE")
+    all_rows = (headers, *rows)
+    widths = tuple(max(len(row[index]) for row in all_rows) for index in range(len(headers)))
+    stacked = sum(widths) + 2 * len(headers) > shutil.get_terminal_size().columns
     print("Last-fetched state; no network access or branch updates.")
-    print("BRANCH\tUPSTREAM\tAHEAD\tBEHIND\tSTATE")
-    for branch in branches:
-        if branch.upstream_error:
-            state = f"invalid-upstream; {branch.upstream_error}"
-        elif not branch.upstream:
-            state = "local-only"
-        elif branch.upstream_oid is None:
-            state = "missing-upstream"
-        elif branch.ahead and branch.behind:
-            state = "diverged"
-        elif branch.ahead:
-            state = "ahead"
-        elif branch.behind:
-            state = "behind"
-        else:
-            state = "matching"
-        tree = trees.get(branch.ref)
-        if tree:
-            state += f"; worktree={tree.path}"
-            if tree.locked:
-                state += "; locked"
-        prefix = "*" if branch.ref == current else " "
-        upstream = branch.upstream.removeprefix("refs/remotes/") or "-"
-        print(f"{prefix}{branch.name}\t{upstream}\t{branch.ahead}\t{branch.behind}\t{state}")
-    return int(any(branch.upstream_error for branch in branches))
+    print("* current branch; + checked out in another worktree")
+    groups = (
+        (
+            "Attention needed",
+            frozenset({"invalid-upstream", "missing-upstream", "diverged", "ahead", "behind"}),
+        ),
+        ("Matching", frozenset({"matching"})),
+        ("Local-only", frozenset({"local-only"})),
+    )
+    for title, members in groups:
+        selected = tuple(
+            (branch, row)
+            for branch, state, row in zip(branches, states, rows, strict=True)
+            if state in members
+        )
+        if not selected:
+            continue
+        print(f"\n{title} ({len(selected)})")
+        if not stacked:
+            print(_status_columns(headers, widths))
+        for branch, row in selected:
+            if stacked:
+                print(f"  {row[0]}\n    upstream: {row[1]}")
+                print(f"    state: {row[4]}; ahead: {row[2]}; behind: {row[3]}")
+            else:
+                print(_status_columns(row, widths))
+            if branch.upstream_error:
+                for line in branch.upstream_error.splitlines():
+                    print(f"    {line}")
+            tree = trees.get(branch.ref)
+            if tree:
+                print(f"    worktree: {tree.path}" + (" (locked)" if tree.locked else ""))
+            if stacked:
+                print()
+    if not branches:
+        print("\nNo local branches.")
+    sys.stdout.flush()
+    return int("invalid-upstream" in states)
 
 
 def _result_category(result: Result) -> str:

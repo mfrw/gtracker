@@ -235,3 +235,30 @@ def test_fetch_failure_reports_zero_updates_and_one_failure(sandbox: Sandbox) ->
         "failed": 1,
     }
     assert sandbox.git("rev-parse", "HEAD").stdout.strip() == original
+
+
+@pytest.mark.parametrize("width", [40, 240])
+def test_status_keeps_full_names_and_worktree_locations(
+    sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch, width: int
+) -> None:
+    branch = "topic/" + "long-descriptive-branch-name-" * 2
+    linked = sandbox.repo.parent / "linked worktree"
+    sandbox.git("branch", "topic", "main", path=sandbox.remote)
+    sandbox.git("fetch", "origin")
+    sandbox.git("branch", branch, "origin/topic")
+    sandbox.git("worktree", "add", str(linked), branch)
+    sandbox.git("branch", "local", "main")
+    sandbox.commit("ahead.txt", "local change")
+    monkeypatch.setenv("COLUMNS", str(width))
+
+    result = sandbox.cli("status")
+
+    assert result.returncode == 0, result.stderr
+    assert branch in result.stdout
+    assert "origin/topic" in result.stdout
+    assert str(linked) in result.stdout
+    assert "ahead" in result.stdout
+    assert "matching" in result.stdout
+    assert "local-only" in result.stdout
+    assert f"+ {branch}" in result.stdout
+    assert "* main" in result.stdout
