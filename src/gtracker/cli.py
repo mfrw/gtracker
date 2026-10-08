@@ -6,7 +6,7 @@ from importlib.metadata import version
 
 from gtracker.mirror import list_backups, restore, sync_mirror
 from gtracker.rebase import RebaseConflict, pull_rebase, sync_rebase
-from gtracker.repo import GitError, Repo, Result, UpdateError, locked
+from gtracker.repo import GitError, Repo, Result, UpdateError, UpdateInterrupted, locked
 
 
 def parser() -> argparse.ArgumentParser:
@@ -127,6 +127,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         repo = Repo.open(args.repo, offline=args.command in {"status", "backups"})
         return execute(args, repo)
+    except UpdateInterrupted as exc:
+        show_results(exc.results)
+        print(f"gtracker: {exc}", file=sys.stderr)
+        return 130
     except (GitError, OSError) as exc:
         if isinstance(exc, (UpdateError, RebaseConflict)):
             show_results(exc.results)

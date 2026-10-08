@@ -4,7 +4,16 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from gtracker.repo import Branch, FetchReport, GitError, Repo, Result, UpdateError, Worktree
+from gtracker.repo import (
+    Branch,
+    FetchReport,
+    GitError,
+    Repo,
+    Result,
+    UpdateError,
+    UpdateInterrupted,
+    Worktree,
+)
 
 BACKUP_PREFIX = "refs/gtracker/backups/"
 
@@ -28,18 +37,36 @@ def _require_direct(repo: Repo, branch: Branch) -> None:
         raise GitError(f"Branch changed concurrently: {branch.name}; inspect and retry")
 
 
+def _interrupted(
+    repo: Repo, branch: Branch, backup: str | None, exc: KeyboardInterrupt | None = None
+) -> UpdateInterrupted:
+    saved = backup if backup and repo.oid(backup) == branch.oid else None
+    detail = f"inspect Git state at {repo.path}; original tip: {branch.oid}"
+    return UpdateInterrupted(
+        f"{exc}\nInterrupted updating {branch.name}: {detail}"
+        if exc
+        else f"Interrupted updating {branch.name}: {detail}",
+        (Result(branch.name, "interrupted", detail, saved),),
+        recovery_safe=exc.recovery_safe if isinstance(exc, UpdateInterrupted) else True,
+    )
+
+
 def create_backup(repo: Repo, branch: Branch, reason: str = "update") -> str:
     _require_direct(repo, branch)
     ref = _backup_ref(branch)
-    repo.git(
-        "update-ref",
-        "-m",
-        f"gtracker backup before {reason}",
-        "--stdin",
-        input=(
-            f"start\nverify {branch.ref} {branch.oid}\ncreate {ref} {branch.oid}\nprepare\ncommit\n"
-        ),
-    )
+    try:
+        repo.git(
+            "update-ref",
+            "-m",
+            f"gtracker backup before {reason}",
+            "--stdin",
+            input=(
+                f"start\nverify {branch.ref} {branch.oid}\n"
+                f"create {ref} {branch.oid}\nprepare\ncommit\n"
+            ),
+        )
+    except KeyboardInterrupt as exc:
+        raise _interrupted(repo, branch, ref, exc) from exc
     return ref
 
 
@@ -87,6 +114,8 @@ def _replace(repo: Repo, branch: Branch, target: str, *, save: bool, reason: str
         try:
             _require_direct(repo, branch)
             checkout.git("reset", "--keep", target)
+        except KeyboardInterrupt as exc:
+            raise _interrupted(checkout, branch, backup, exc) from exc
         except GitError as exc:
             if backup:
                 raise GitError(f"{exc}\nOriginal tip backup: {backup}") from exc
@@ -99,9 +128,16 @@ def _replace(repo: Repo, branch: Branch, target: str, *, save: bool, reason: str
     # Manual concurrent Git mutations are unsupported; recheck immediately before commit.
     if _branch_tree(repo, branch):
         raise GitError(f"Branch was checked out concurrently: {branch.name}")
-    repo.git(
-        "update-ref", "-m", f"gtracker {reason}", "--stdin", input=commands + "prepare\ncommit\n"
-    )
+    try:
+        repo.git(
+            "update-ref",
+            "-m",
+            f"gtracker {reason}",
+            "--stdin",
+            input=commands + "prepare\ncommit\n",
+        )
+    except KeyboardInterrupt as exc:
+        raise _interrupted(repo, branch, backup, exc) from exc
     return backup
 
 
@@ -152,11 +188,26 @@ def sync_mirror(
         if before.get(branch.ref) != branch.oid:
             raise GitError(f"Branch changed during fetch: {branch.name}; inspect and retry")
     results: tuple[Result, ...] = ()
-    for branch in selected:
-        try:
+    current: Branch | None = None
+    try:
+        for branch in selected:
+            current = branch
             results = (*results, _mirror_branch(repo, branch, fetched, dry_run))
-        except GitError as exc:
-            raise UpdateError(f"Mirror stopped at {branch.name}: {exc}", results) from exc
+            current = None
+    except UpdateInterrupted as exc:
+        raise UpdateInterrupted(
+            str(exc), (*results, *exc.results), recovery_safe=exc.recovery_safe
+        ) from exc
+    except KeyboardInterrupt as exc:
+        pending = _interrupted(repo, current, None).results if current is not None else ()
+        raise UpdateInterrupted(
+            "Mirror interrupted; inspect Git state before retrying.", (*results, *pending)
+        ) from exc
+    except GitError as exc:
+        name = current.name if current is not None else "batch"
+        raise UpdateError(
+            f"Mirror stopped at {name}: {exc}", (*results, Result(name, "failed", str(exc)))
+        ) from exc
     return results
 
 

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .mirror import create_backup
-from .repo import Branch, GitError, Repo, Result, UpdateError, Worktree
+from .repo import Branch, GitError, Repo, Result, UpdateError, UpdateInterrupted, Worktree
 
 
 class RebaseConflict(GitError):
@@ -184,77 +184,120 @@ def _guard_tip(repo: Repo, branch: Branch) -> None:
 
 def _finish(repo: Repo, branch: Branch, backup: str) -> Result:
     if repo.oid(branch.ref) == branch.oid:
-        repo.git("update-ref", "-d", backup, branch.oid)
-        return Result(branch.name, "unchanged")
+        return Result(branch.name, "unchanged", str(repo.path), backup)
     return Result(branch.name, "rebased", str(repo.path), backup)
+
+
+def _interrupted(
+    repo: Repo, branch: str | None, exc: KeyboardInterrupt, backup: str | None = None
+) -> UpdateInterrupted:
+    command = f"git -C {shlex.quote(str(repo.path))}"
+    detail = (
+        f"Interrupted at worktree {repo.path}. No operation was aborted or changes discarded. "
+        f"Inspect manually with {command} status; for an active rebase, resolve and run "
+        f"{command} rebase --continue, or manually choose {command} rebase --abort."
+    )
+    if backup:
+        detail += f" Original tip backup: {backup}."
+    results = exc.results if isinstance(exc, UpdateInterrupted) else ()
+    if branch and not any(row.branch == branch for row in results):
+        results = (*results, Result(branch, "interrupted", str(repo.path), backup))
+    message = f"{exc}\n{detail}" if str(exc) else detail
+    safe = exc.recovery_safe if isinstance(exc, UpdateInterrupted) else True
+    return UpdateInterrupted(message, results, recovery_safe=safe)
 
 
 def _integrate(repo: Repo, plan: _Plan, target: str, dry_run: bool) -> Result:
     branch = plan.branch
-    _guard_tip(repo, branch)
-    boundary = _boundary(repo, plan.upstream, target)
-    if boundary == target and _is_ancestor(repo, target, branch.oid):
-        return Result(branch.name, "unchanged")
-    _protect_replay(repo, branch, boundary)
-    if dry_run:
-        return Result(branch.name, "would-rebase", f"onto {target} at {repo.path}")
-    if repo.current_branch() != branch.ref:
-        raise GitError(f"Expected {branch.name} checked out at {repo.path}")
-    repo.ensure_clean(target)
-    backup = create_backup(repo, branch, "rebase")
-    if _is_ancestor(repo, branch.oid, target):
-        result = repo.git(
-            "merge", "--ff-only", "--no-squash", "--no-autostash", "--no-edit", target, check=False
-        )
-    else:
-        result = repo.git(
-            "-c",
-            "rebase.updateRefs=false",
-            "rebase",
-            "--no-autostash",
-            "--no-fork-point",
-            "--onto",
-            target,
-            boundary,
-            check=False,
-        )
-    if result.returncode:
-        detail = result.stderr.strip() or result.stdout.strip() or "Git rebase failed"
-        if repo.operation() in ("rebase-merge", "rebase-apply"):
-            raise RebaseConflict(branch.name, repo.path, backup, detail)
-        recovery = backup
-        if repo.oid(branch.ref) == branch.oid:
-            repo.git("update-ref", "-d", backup, branch.oid)
-            recovery = branch.oid
-        raise GitError(
-            f"Cannot rebase {branch.name} at {repo.path}: {detail}; original tip: {recovery}"
-        )
-    return _finish(repo, branch, backup)
+    backup: str | None = None
+    try:
+        _guard_tip(repo, branch)
+        boundary = _boundary(repo, plan.upstream, target)
+        if boundary == target and _is_ancestor(repo, target, branch.oid):
+            return Result(branch.name, "unchanged")
+        _protect_replay(repo, branch, boundary)
+        if dry_run:
+            return Result(branch.name, "would-rebase", f"onto {target} at {repo.path}")
+        if repo.current_branch() != branch.ref:
+            raise GitError(f"Expected {branch.name} checked out at {repo.path}")
+        repo.ensure_clean(target)
+        backup = create_backup(repo, branch, "rebase")
+        if _is_ancestor(repo, branch.oid, target):
+            result = repo.git(
+                "merge",
+                "--ff-only",
+                "--no-squash",
+                "--no-autostash",
+                "--no-edit",
+                target,
+                check=False,
+            )
+        else:
+            result = repo.git(
+                "-c",
+                "rebase.updateRefs=false",
+                "rebase",
+                "--no-autostash",
+                "--no-fork-point",
+                "--onto",
+                target,
+                boundary,
+                check=False,
+            )
+        if result.returncode:
+            detail = result.stderr.strip() or result.stdout.strip() or "Git rebase failed"
+            if repo.operation() in ("rebase-merge", "rebase-apply"):
+                raise RebaseConflict(branch.name, repo.path, backup, detail)
+            raise GitError(
+                f"Cannot rebase {branch.name} at {repo.path}: {detail}; original tip: {backup}"
+            )
+        return _finish(repo, branch, backup)
+    except KeyboardInterrupt as exc:
+        raise _interrupted(repo, branch.name, exc, backup) from exc
+    except RebaseConflict:
+        raise
+    except GitError as exc:
+        raise UpdateError(
+            str(exc), (Result(branch.name, "failed", str(repo.path), backup),)
+        ) from exc
 
 
 def pull_rebase(repo: Repo, upstream: str | None = None, dry_run: bool = False) -> Result:
     """Rebase the current branch without changing its tracking configuration."""
-    current = repo.current_branch()
-    if current is None:
-        raise GitError("Pull with rebase requires a current local branch, not detached HEAD")
-    branch = repo.branch(current.removeprefix("refs/heads/"))
-    _validate_branch(repo, branch)
-    source = _upstream(repo, branch, upstream)
-    if source.old_oid is None:
-        raise GitError(f"Missing upstream for {branch.name}: {source.tracking_ref}")
-    repo.ensure_safe_fetch()
-    repo.ensure_no_operations()
-    repo.ensure_clean()
-    if any(tree.path == repo.path and tree.locked for tree in repo.worktrees()):
-        raise GitError(f"Worktree is locked: {repo.path}")
-    # Capture the replay boundary above, before Git updates the tracking ref.
-    # Pin FETCH_HEAD so a remote rewrite cannot change the checked target again.
-    repo.git("fetch", "--prune", "--", source.remote, source.remote_ref)
-    target = repo.oid("FETCH_HEAD")
-    if target is None:
-        raise GitError(f"No fetched upstream commit for {branch.name}")
-    repo.ensure_clean(target)
-    return _integrate(repo, _Plan(branch, source), target, dry_run)
+    name: str | None = None
+    try:
+        current = repo.current_branch()
+        if current is None:
+            raise GitError("Pull with rebase requires a current local branch, not detached HEAD")
+        name = current.removeprefix("refs/heads/")
+        branch = repo.branch(name)
+        _validate_branch(repo, branch)
+        source = _upstream(repo, branch, upstream)
+        if source.old_oid is None:
+            raise GitError(f"Missing upstream for {branch.name}: {source.tracking_ref}")
+        repo.ensure_safe_fetch()
+        repo.ensure_no_operations()
+        repo.ensure_clean()
+        if any(tree.path == repo.path and tree.locked for tree in repo.worktrees()):
+            raise GitError(f"Worktree is locked: {repo.path}")
+        # Capture the replay boundary above, before Git updates the tracking ref.
+        # Pin FETCH_HEAD so a remote rewrite cannot change the checked target again.
+        repo.git("fetch", "--prune", "--", source.remote, source.remote_ref)
+        target = repo.oid("FETCH_HEAD")
+        if target is None:
+            raise GitError(f"No fetched upstream commit for {branch.name}")
+        repo.ensure_clean(target)
+        return _integrate(repo, _Plan(branch, source), target, dry_run)
+    except UpdateInterrupted:
+        raise
+    except KeyboardInterrupt as exc:
+        raise _interrupted(repo, name, exc) from exc
+    except (RebaseConflict, UpdateError):
+        raise
+    except GitError as exc:
+        if name is None:
+            raise
+        raise UpdateError(str(exc), (Result(name, "failed", str(exc)),)) from exc
 
 
 def _select(repo: Repo, names: tuple[str, ...]) -> tuple[_Plan, ...]:
@@ -296,12 +339,22 @@ def _checkout_repo(
         _protect_replay(working, branch, _boundary(working, plan.upstream, target))
     except GitError as exc:
         return Result(branch.name, "skipped", f"dirty or unsafe worktree at {working.path}: {exc}")
+    except KeyboardInterrupt as exc:
+        raise _interrupted(working, branch.name, exc) from exc
     if not tree and not dry_run:
-        working.git("switch", "--no-overwrite-ignore", "--no-guess", "--", branch.name)
+        try:
+            working.git("switch", "--no-overwrite-ignore", "--no-guess", "--", branch.name)
+        except KeyboardInterrupt as exc:
+            raise _interrupted(working, branch.name, exc) from exc
     return working
 
 
 def _restore_checkout(repo: Repo, original: str | None, original_oid: str) -> None:
+    # Only the caller matters here: an active linked rebase must remain intact
+    # without preventing restoration of this otherwise unaffected worktree.
+    operation = repo.operation()
+    if operation:
+        raise GitError(f"Worktree {repo.path} retains active {operation}; recover manually")
     if repo.current_branch() == original and (
         original is not None or repo.oid("HEAD") == original_oid
     ):
@@ -322,6 +375,14 @@ def _restore_checkout(repo: Repo, original: str | None, original_oid: str) -> No
         repo.git("switch", "--no-overwrite-ignore", "--detach", original_oid)
 
 
+def _restore_note(repo: Repo, original: str | None, original_oid: str) -> str:
+    try:
+        _restore_checkout(repo, original, original_oid)
+    except GitError as exc:
+        return f"\nCannot restore caller checkout at {repo.path}; recover manually: {exc}"
+    return ""
+
+
 def sync_rebase(
     repo: Repo, names: tuple[str, ...] = (), dry_run: bool = False
 ) -> tuple[Result, ...]:
@@ -331,54 +392,75 @@ def sync_rebase(
     original, original_oid = repo.current_branch(), repo.oid("HEAD")
     if original_oid is None:
         raise GitError("Sync with rebase requires an existing checkout commit")
-    fetched = repo.fetch_all()
     results: tuple[Result, ...] = ()
+    plan: _Plan | None = None
     try:
-        for plan in plans:
-            _guard_tip(repo, plan.branch)
-            source = plan.upstream
-            target = (
-                repo.oid(source.tracking_ref)
-                if source.remote == "."
-                else fetched.oid(source.remote, source.tracking_ref)
-            )
-            if target is None:
-                cached = repo.oid(source.tracking_ref)
-                action = "skipped-unfetched" if cached else "skipped-missing"
-                reason = "upstream not fetched" if cached else "missing upstream"
-                results = (
-                    *results,
-                    Result(
-                        plan.branch.name,
-                        action,
-                        f"{reason}: {source.tracking_ref}",
-                    ),
+        try:
+            fetched = repo.fetch_all()
+            for plan in plans:
+                _guard_tip(repo, plan.branch)
+                source = plan.upstream
+                target = (
+                    repo.oid(source.tracking_ref)
+                    if source.remote == "."
+                    else fetched.oid(source.remote, source.tracking_ref)
                 )
-                continue
-            working = _checkout_repo(repo, plan, target, repo.worktrees(), dry_run)
-            if isinstance(working, Result):
-                results = (*results, working)
-                continue
-            results = (*results, _integrate(working, plan, target, dry_run))
-    except RebaseConflict as exc:
-        detail = exc.detail
-        if exc.path.resolve() != repo.path.resolve():
-            try:
-                _restore_checkout(repo, original, original_oid)
-            except GitError as recovery_error:
-                detail += f"\nCaller checkout restoration failed: {recovery_error}"
-        raise RebaseConflict(exc.branch, exc.path, exc.backup, detail, results) from exc
-    except GitError as exc:
+                if target is None:
+                    cached = repo.oid(source.tracking_ref)
+                    action = "skipped-unfetched" if cached else "skipped-missing"
+                    reason = "upstream not fetched" if cached else "missing upstream"
+                    results = (
+                        *results,
+                        Result(plan.branch.name, action, f"{reason}: {source.tracking_ref}"),
+                    )
+                    continue
+                working = _checkout_repo(repo, plan, target, repo.worktrees(), dry_run)
+                if isinstance(working, Result):
+                    results = (*results, working)
+                    continue
+                results = (*results, _integrate(working, plan, target, dry_run))
+        except RebaseConflict as exc:
+            current = exc.results or (Result(exc.branch, "conflict", str(exc.path), exc.backup),)
+            results = (*results, *current)
+            plan = None
+            detail = exc.detail
+            if exc.path.resolve() != repo.path.resolve() and not dry_run:
+                detail += _restore_note(repo, original, original_oid)
+            raise RebaseConflict(exc.branch, exc.path, exc.backup, detail, results) from exc
+        except GitError as exc:
+            current = exc.results if isinstance(exc, UpdateError) else ()
+            if plan is not None and not current:
+                current = (Result(plan.branch.name, "failed", str(exc)),)
+            results = (*results, *current)
+            plan = None
+            recovery = "" if dry_run else _restore_note(repo, original, original_oid)
+            raise UpdateError(f"{exc}{recovery}", results) from exc
+        plan = None
         if not dry_run:
             try:
                 _restore_checkout(repo, original, original_oid)
-            except GitError as recovery_error:
-                message = f"{exc}; cannot restore initial checkout: {recovery_error}"
-                raise UpdateError(message, results) from recovery_error
-        raise UpdateError(str(exc), results) from exc
-    if not dry_run:
-        try:
-            _restore_checkout(repo, original, original_oid)
-        except GitError as exc:
-            raise UpdateError(f"Cannot restore initial checkout: {exc}", results) from exc
+            except GitError as exc:
+                raise UpdateError(f"Cannot restore initial checkout: {exc}", results) from exc
+    except KeyboardInterrupt as exc:
+        branch = plan.branch.name if plan else None
+        if any(row.branch == branch for row in results):
+            branch = None
+        interrupted = exc if isinstance(exc, UpdateInterrupted) else _interrupted(repo, branch, exc)
+        recovery = ""
+        safe = interrupted.recovery_safe
+        if not dry_run and safe:
+            try:
+                recovery = _restore_note(repo, original, original_oid)
+            except KeyboardInterrupt as recovery_error:
+                recovery = (
+                    f"\nCaller recovery interrupted at {repo.path}; inspect manually."
+                    f"\n{recovery_error}"
+                )
+                if isinstance(recovery_error, UpdateInterrupted):
+                    safe = safe and recovery_error.recovery_safe
+        raise UpdateInterrupted(
+            f"{interrupted}{recovery}",
+            (*results, *interrupted.results),
+            recovery_safe=safe,
+        ) from exc
     return results

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
+import signal
 import stat
 import subprocess
+import time
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -50,6 +53,21 @@ class UpdateError(GitError):
         super().__init__(message)
 
 
+class UpdateInterrupted(KeyboardInterrupt):
+    """An interrupted update with completed results and recovery information."""
+
+    def __init__(
+        self,
+        message: str,
+        results: tuple[Result, ...] = (),
+        *,
+        recovery_safe: bool = True,
+    ) -> None:
+        self.results = results
+        self.recovery_safe = recovery_safe
+        super().__init__(message)
+
+
 @dataclass(frozen=True)
 class FetchedRef:
     remote: str
@@ -75,6 +93,103 @@ class FetchReport:
         )
 
 
+_GIT_INTERRUPT_GRACE = 5.0
+_GIT_GROUP_EXIT_GRACE = 1.0
+_GIT_GROUP_POLL_INTERVAL = 0.01
+_GIT_SIGNAL_POLL_INTERVAL = 0.1
+
+
+def _signal_git(process: subprocess.Popen[bytes], signum: int) -> None:
+    try:
+        os.killpg(process.pid, signum)
+    except ProcessLookupError:
+        pass  # Git and its process group have already exited.
+
+
+def _git_group_exists(process: subprocess.Popen[bytes]) -> bool:
+    try:
+        os.killpg(process.pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def _stop_git(process: subprocess.Popen[bytes]) -> None:
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        _signal_git(process, signal.SIGINT)
+        try:
+            process.communicate(timeout=_GIT_INTERRUPT_GRACE)
+        except subprocess.TimeoutExpired:
+            pass  # Force termination below, including hooks that closed their pipes.
+        _signal_git(process, signal.SIGKILL)
+        process.communicate()
+        deadline = time.monotonic() + _GIT_GROUP_EXIT_GRACE
+        while _git_group_exists(process) and time.monotonic() < deadline:
+            time.sleep(_GIT_GROUP_POLL_INTERVAL)
+        if _git_group_exists(process):
+            raise UpdateInterrupted(
+                "Git process group has not exited; automatic checkout recovery was disabled. "
+                "Inspect Git processes and worktree state before retrying.",
+                recovery_safe=False,
+            )
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+def _set_foreground(terminal: int, group: int) -> None:
+    blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTTOU})
+    try:
+        os.tcsetpgrp(terminal, group)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+
+
+@contextmanager
+def _git_foreground(process: subprocess.Popen[bytes]) -> Iterator[None]:
+    try:
+        terminal = os.open("/dev/tty", os.O_RDWR | os.O_CLOEXEC)
+    except OSError as exc:
+        if exc.errno not in {errno.ENXIO, errno.ENODEV, errno.ENOTTY, errno.ENOENT}:
+            raise
+        yield
+        return
+    original: int | None = None
+    try:
+        if os.tcgetpgrp(terminal) == os.getpgrp():
+            original = os.getpgrp()
+            _set_foreground(terminal, process.pid)
+            # Git may have attempted a terminal read before the foreground handoff.
+            _signal_git(process, signal.SIGCONT)
+        yield
+    finally:
+        try:
+            if original is not None:
+                _set_foreground(terminal, original)
+        finally:
+            os.close(terminal)
+
+
+def _communicate_git(
+    process: subprocess.Popen[bytes], input: bytes | None
+) -> tuple[bytes, bytes | None]:
+    try:
+        with _git_foreground(process):
+            output: tuple[bytes, bytes | None] | None = None
+            while output is None:
+                try:
+                    output = process.communicate(input, timeout=_GIT_SIGNAL_POLL_INTERVAL)
+                except subprocess.TimeoutExpired:
+                    input = None
+                # A surviving hook can hold pipes open after terminal Ctrl-C kills Git.
+                if process.poll() in (-signal.SIGINT, 128 + signal.SIGINT):
+                    raise KeyboardInterrupt
+            return output
+    except (KeyboardInterrupt, OSError):
+        _stop_git(process)
+        raise
+
+
 @dataclass(frozen=True)
 class Repo:
     path: Path
@@ -89,7 +204,10 @@ class Repo:
         return cls(Path(root), offline)
 
     def git(
-        self, *args: str, check: bool = True, input: str | None = None
+        self,
+        *args: str,
+        check: bool = True,
+        input: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = {
             key: value
@@ -107,15 +225,23 @@ class Repo:
         if self.offline:
             env = {**env, "GIT_NO_LAZY_FETCH": "1"}
         try:
-            raw = subprocess.run(
+            with subprocess.Popen(
                 ["git", "--no-pager", "-c", "submodule.recurse=false", "-C", str(self.path), *args],
-                input=os.fsencode(input) if input is not None else None,
-                capture_output=True,
+                stdin=subprocess.PIPE if input is not None else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 env=env,
-            )
-            result = subprocess.CompletedProcess(
-                raw.args, raw.returncode, os.fsdecode(raw.stdout), os.fsdecode(raw.stderr)
-            )
+                process_group=0,
+            ) as process:
+                stdout, stderr = _communicate_git(
+                    process, os.fsencode(input) if input is not None else None
+                )
+                result = subprocess.CompletedProcess(
+                    process.args,
+                    process.returncode,
+                    os.fsdecode(stdout),
+                    os.fsdecode(stderr or b""),
+                )
         except OSError as exc:
             raise GitError(f"Cannot run Git: {exc}") from exc
         if check and result.returncode:
@@ -307,17 +433,26 @@ class Repo:
         )
 
     def fetch_all(self) -> FetchReport:
-        self.ensure_safe_fetch()
-        remotes = tuple(self.git("remote").stdout.splitlines())
-        skipped = {
-            key.rsplit(".", 1)[0].removeprefix("remote."): value == "true"
-            for key, value in self.config_values(
-                r"^remote\..*\.(skipfetchall|skipdefaultupdate)$", boolean=True
-            )
-        }
-        selected = tuple(remote for remote in remotes if not skipped.get(remote, False))
-        fetched = tuple(self._fetch_remote(remote) for remote in selected)
-        return FetchReport(frozenset(selected), tuple(ref for refs in fetched for ref in refs))
+        try:
+            self.ensure_safe_fetch()
+            remotes = tuple(self.git("remote").stdout.splitlines())
+            skipped = {
+                key.rsplit(".", 1)[0].removeprefix("remote."): value == "true"
+                for key, value in self.config_values(
+                    r"^remote\..*\.(skipfetchall|skipdefaultupdate)$", boolean=True
+                )
+            }
+            selected = tuple(remote for remote in remotes if not skipped.get(remote, False))
+            fetched = tuple(self._fetch_remote(remote) for remote in selected)
+            return FetchReport(frozenset(selected), tuple(ref for refs in fetched for ref in refs))
+        except KeyboardInterrupt as exc:
+            detail = f"\n{exc}" if str(exc) else ""
+            safe = exc.recovery_safe if isinstance(exc, UpdateInterrupted) else True
+            raise UpdateInterrupted(
+                "Interrupted during fetch; no local branches were updated. "
+                f"Remote-tracking refs may have changed.{detail}",
+                recovery_safe=safe,
+            ) from exc
 
 
 @contextmanager
