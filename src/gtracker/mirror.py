@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import groupby
 from uuid import uuid4
 
 from gtracker.repo import (
@@ -84,6 +85,89 @@ def _parse_backup(row: str) -> Backup:
     if len(parts) != 2:
         raise GitError(f"Malformed gtracker backup ref: {ref}")
     return Backup(ref, parts[1], oid)
+
+
+def _backup_time(backup: Backup) -> datetime:
+    generation = backup.ref.removeprefix(BACKUP_PREFIX).split("/", 1)[0]
+    stamp = generation.partition("-")[0]
+    try:
+        return datetime.strptime(stamp, "%Y%m%dT%H%M%S.%fZ").replace(tzinfo=UTC)
+    except ValueError as exc:
+        raise GitError(
+            f"Cannot determine backup creation time: {backup.ref}; "
+            "use --all for explicit cleanup instead of --keep"
+        ) from exc
+
+
+def _older_backups(backups: tuple[Backup, ...], keep: int) -> tuple[Backup, ...]:
+    ordered = sorted(
+        backups, key=lambda backup: (backup.branch, _backup_time(backup), backup.ref), reverse=True
+    )
+    return tuple(
+        backup
+        for _, history in groupby(ordered, key=lambda backup: backup.branch)
+        for backup in tuple(history)[keep:]
+    )
+
+
+def _ensure_backups_unused(repo: Repo, backups: tuple[Backup, ...]) -> None:
+    refs = frozenset(backup.ref for backup in backups)
+    root_refs = (
+        "HEAD",
+        "FETCH_HEAD",
+        "ORIG_HEAD",
+        "MERGE_HEAD",
+        "MERGE_AUTOSTASH",
+        "REBASE_HEAD",
+        "REVERT_HEAD",
+        "CHERRY_PICK_HEAD",
+        "BISECT_HEAD",
+        "AUTO_MERGE",
+    )
+    for tree in repo.worktrees():
+        checkout = Repo(tree.path, offline=True)
+        for name in root_refs:
+            result = checkout.git("symbolic-ref", "-q", name, check=False)
+            if result.returncode not in (0, 1):
+                raise GitError(result.stderr.strip() or f"Cannot inspect {name} at {tree.path}")
+            target = result.stdout.removesuffix("\n")
+            if target in refs:
+                raise GitError(f"Backup is used by {name} at {tree.path}: {target}")
+        rows = checkout.git("for-each-ref", "--format=%(refname)%09%(symref)").stdout
+        for row in rows.splitlines():
+            ref, target = row.split("\t")
+            if target in refs:
+                raise GitError(f"Backup is used by symbolic ref {ref} at {tree.path}: {target}")
+
+
+def cleanup_backups(
+    repo: Repo,
+    names: tuple[str, ...] = (),
+    *,
+    keep: int | None,
+    dry_run: bool = False,
+) -> tuple[Backup, ...]:
+    """Delete selected backup refs; keep=None explicitly selects all saved tips."""
+    if keep is not None and keep < 1:
+        raise GitError("--keep must be positive; use --all to remove every selected backup")
+    offline = Repo(repo.path, offline=True)
+    backups = list_backups(offline)
+    selected = frozenset(names)
+    unknown = selected - {backup.branch for backup in backups}
+    if unknown:
+        raise GitError(f"No gtracker backups for branch(es): {', '.join(sorted(unknown))}")
+    matching = tuple(backup for backup in backups if not selected or backup.branch in selected)
+    candidates = matching if keep is None else _older_backups(matching, keep)
+    if not candidates:
+        return ()
+    offline.ensure_no_operations()
+    _ensure_backups_unused(offline, candidates)
+    if not dry_run:
+        deletes = "".join(f"delete {backup.ref} {backup.oid}\n" for backup in candidates)
+        offline.git(
+            "update-ref", "--no-deref", "--stdin", input=f"start\n{deletes}prepare\ncommit\n"
+        )
+    return candidates
 
 
 def _branch_tree(repo: Repo, branch: Branch) -> Worktree | None:

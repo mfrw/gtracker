@@ -159,6 +159,30 @@ gtracker restore refs/gtracker/backups/<id>/<branch> --repo ~/linux
 
 Copy the full ref from `backups`; arbitrary Git revisions are not accepted. Restore defaults to the original branch, which must still exist. `--branch existing-local-branch` chooses another existing branch without changing its upstream configuration. Restoration saves the replaced tip too, and refuses dirty/locked worktrees or active Git operations. Backups are direct commit refs outside `refs/heads/`, keep their objects reachable, and are never automatically expired.
 
+### Clean up saved tips
+
+```sh
+# Preview, then keep the newest three backups for each branch.
+gtracker cleanup --keep 3 --dry-run --repo ~/linux
+gtracker cleanup --keep 3 --yes --repo ~/linux
+
+# Preview, then remove every gtracker backup.
+gtracker cleanup --all --dry-run --repo ~/linux
+gtracker cleanup --all --yes --repo ~/linux
+```
+
+Both a policy (`--keep N` or `--all`) and an execution mode (`--dry-run` or `--yes`) are required. `N` must be positive; use `--all`, not `--keep 0`, to remove every selected backup. Output lists each exact ref and a final deletion or preview count.
+
+Add `--branch rcu-dev` to limit either policy to that original branch name; repeat `--branch` for several names. Selection is exact, not a prefix match, and works even after the original local branch was deleted. An unmatched name aborts without deleting any backups.
+
+Retention uses the UTC creation timestamp encoded in the backup ref, not the saved commit's date. Selected backups with unrecognizable timestamps make `--keep` fail without deletion; `--all` can explicitly remove them. Backups are not expired automatically.
+
+Cleanup is offline, including its dry run, and only removes refs under `refs/gtracker/backups/`. It does not fetch, change local branches or worktree/index contents, or run garbage collection. Dirty worktrees are allowed, but active Git operations or unavailable registered worktrees block a nonempty cleanup. Deletions use one Git transaction with expected-old OIDs and no symbolic-ref dereferencing, under the shared gtracker lock.
+
+Backups used by ordinary or worktree-private symbolic refs are protected. The standard-root checks cover `HEAD`, `FETCH_HEAD`, `ORIG_HEAD`, `MERGE_HEAD`, `MERGE_AUTOSTASH`, `REBASE_HEAD`, `REVERT_HEAD`, `CHERRY_PICK_HEAD`, `BISECT_HEAD`, and `AUTO_MERGE` in every registered worktree; arbitrary custom root refs are not enumerated.
+
+**Deletion removes gtracker's recovery refs and may make saved-only history eligible for later Git garbage collection.** There is no automatic undo and disk space is not necessarily freed immediately. After interruption, inspect `gtracker backups` before retrying; do not assume the transaction rolled back.
+
 ## Safety boundaries
 
 - No automatic stashing, hard reset, branch deletion, merge commits, conflict resolution, or push.

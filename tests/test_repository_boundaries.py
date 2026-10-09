@@ -51,23 +51,33 @@ def _unavailable_promisor(
     return marker
 
 
-@pytest.mark.parametrize("command", ["status", "backups"])
-def test_read_only_commands_do_not_lazy_fetch_missing_promisor_objects(
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("status",),
+        ("backups",),
+        ("cleanup", "--all", "--dry-run"),
+        ("cleanup", "--all", "--yes"),
+    ],
+)
+def test_offline_commands_do_not_lazy_fetch_missing_promisor_objects(
     sandbox: Sandbox,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    command: str,
+    command: tuple[str, ...],
 ) -> None:
     target = sandbox.commit("upstream.txt", "new remote", path=sandbox.remote)
     sandbox.git("fetch", "origin")
     backup = "refs/gtracker/backups/manual/main"
-    if command == "backups":
+    if command[0] != "status":
         sandbox.git("update-ref", backup, target)
     marker = _unavailable_promisor(sandbox, tmp_path, monkeypatch, target)
-    result = sandbox.cli(command)
+    result = sandbox.cli(*command)
     assert not marker.exists()
     assert result.returncode != 0
     assert "Traceback" not in result.stderr
+    if command[0] == "cleanup":
+        assert sandbox.git("rev-parse", "--verify", backup).stdout.strip() == target
 
 
 @pytest.mark.parametrize("command", [("sync",), ("sync", "--strategy", "rebase")])

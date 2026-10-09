@@ -6,9 +6,27 @@ import sys
 from collections import Counter
 from importlib.metadata import version
 
-from gtracker.mirror import list_backups, restore, sync_mirror
+from gtracker.mirror import Backup, cleanup_backups, list_backups, restore, sync_mirror
 from gtracker.rebase import RebaseConflict, pull_rebase, sync_rebase
 from gtracker.repo import Branch, GitError, Repo, Result, UpdateError, UpdateInterrupted, locked
+
+
+def _positive_backup_count(value: str) -> int:
+    count = int(value)
+    if count < 1:
+        raise argparse.ArgumentTypeError("must be positive; use --all to delete every backup")
+    return count
+
+
+def _cleanup_options(command: argparse.ArgumentParser) -> None:
+    policy = command.add_mutually_exclusive_group(required=True)
+    policy.add_argument(
+        "--keep", type=_positive_backup_count, metavar="N", help="keep newest N backups per branch"
+    )
+    policy.add_argument("--all", action="store_true", help="remove all selected backup refs")
+    mode = command.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dry-run", action="store_true", help="preview without deleting backup refs")
+    mode.add_argument("--yes", action="store_true", help="confirm deletion of selected backup refs")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -25,11 +43,12 @@ def parser() -> argparse.ArgumentParser:
     pull = commands.add_parser("pull", help="fetch and rebase the current branch")
     backups = commands.add_parser("backups", help="list saved branch tips")
     recovery = commands.add_parser("restore", help="restore a branch from an exact backup ref")
-    for command in (status, sync, pull, backups, recovery):
+    cleanup = commands.add_parser("cleanup", help="explicitly remove saved branch-tip backups")
+    for command in (status, sync, pull, backups, recovery, cleanup):
         command.add_argument("--repo", default=argparse.SUPPRESS, help="repository path")
-    for command in (status, sync):
+    for command in (status, sync, cleanup):
         command.add_argument(
-            "--branch", action="append", default=[], help="local branch; repeat to select"
+            "--branch", action="append", default=[], help="branch name; repeat to select"
         )
     for command in (sync, pull, recovery):
         command.add_argument(
@@ -46,6 +65,7 @@ def parser() -> argparse.ArgumentParser:
         "backup", help="full refs/gtracker/backups/... ref from `gtracker backups`"
     )
     recovery.add_argument("--branch", help="restore into this existing local branch instead")
+    _cleanup_options(cleanup)
     return root
 
 
@@ -183,6 +203,16 @@ def show_results(
     return int(warning)
 
 
+def show_cleanup(backups: tuple[Backup, ...], *, dry_run: bool) -> int:
+    action = "would-delete" if dry_run else "deleted"
+    for backup in backups:
+        print(f"{backup.branch}: {action} — {backup.ref} ({backup.oid[:12]})")
+    label = "preview" if dry_run else "completed"
+    verb = "would be deleted" if dry_run else "deleted"
+    print(f"\nSummary ({label}): {len(backups)} backup refs {verb}.", flush=True)
+    return 0
+
+
 def execute(args: argparse.Namespace, repo: Repo) -> int:
     if args.command == "status":
         return show_status(repo, tuple(args.branch))
@@ -194,6 +224,11 @@ def execute(args: argparse.Namespace, repo: Repo) -> int:
             print(f"{backup.branch}\t{backup.oid[:12]}\t{backup.ref}")
         return 0
     with locked(repo):
+        if args.command == "cleanup":
+            deleted = cleanup_backups(
+                repo, tuple(args.branch), keep=args.keep, dry_run=args.dry_run
+            )
+            return show_cleanup(deleted, dry_run=args.dry_run)
         if args.command == "restore":
             return show_results(
                 (restore(repo, args.backup, args.branch, args.dry_run),), dry_run=args.dry_run
@@ -214,7 +249,7 @@ def execute(args: argparse.Namespace, repo: Repo) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
-        repo = Repo.open(args.repo, offline=args.command in {"status", "backups"})
+        repo = Repo.open(args.repo, offline=args.command in {"status", "backups", "cleanup"})
         return execute(args, repo)
     except UpdateInterrupted as exc:
         show_results(exc.results, outcome="interrupted", dry_run=getattr(args, "dry_run", False))
