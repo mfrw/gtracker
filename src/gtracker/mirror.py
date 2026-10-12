@@ -177,27 +177,53 @@ def _branch_tree(repo: Repo, branch: Branch) -> Worktree | None:
     return trees[0] if trees else None
 
 
-def _checked_tree(repo: Repo, branch: Branch, target: str) -> Repo | None:
+def _checked_tree(
+    repo: Repo, branch: Branch, target: str, *, preserve_changes: bool = False
+) -> tuple[Repo, bool] | None:
     tree = _branch_tree(repo, branch)
     if tree is None:
         return None
     if tree.locked:
         raise GitError(f"Worktree is locked: {tree.path}")
     checkout = Repo.open(tree.path)
-    checkout.ensure_clean(target)
     if checkout.current_branch() != branch.ref:
         raise GitError(f"Worktree checkout changed: {tree.path}")
-    return checkout
+    if preserve_changes:
+        dirty = checkout.ensure_preservable(target)
+    else:
+        checkout.ensure_clean(target)
+        dirty = False
+    return checkout, dirty
 
 
-def _replace(repo: Repo, branch: Branch, target: str, *, save: bool, reason: str) -> str | None:
+def _replace(
+    repo: Repo,
+    branch: Branch,
+    target: str,
+    *,
+    save: bool,
+    reason: str,
+    preserve_changes: bool = False,
+) -> str | None:
     _require_direct(repo, branch)
-    checkout = _checked_tree(repo, branch, target)
-    if checkout:
+    checked = _checked_tree(repo, branch, target, preserve_changes=preserve_changes)
+    if checked:
+        checkout, dirty = checked
         backup = create_backup(repo, branch, reason) if save else None
         try:
             _require_direct(repo, branch)
-            checkout.git("reset", "--keep", target)
+            if dirty:
+                checkout.git(
+                    "switch",
+                    "--no-overwrite-ignore",
+                    "--no-guess",
+                    "--no-track",
+                    "-C",
+                    branch.name,
+                    target,
+                )
+            else:
+                checkout.git("reset", "--keep", target)
         except KeyboardInterrupt as exc:
             raise _interrupted(checkout, branch, backup, exc) from exc
         except GitError as exc:
@@ -243,7 +269,7 @@ def _mirror_branch(repo: Repo, branch: Branch, fetched: FetchReport, dry_run: bo
         return Result(branch.name, "unchanged")
     _require_direct(repo, branch)
     try:
-        _checked_tree(repo, branch, target)
+        _checked_tree(repo, branch, target, preserve_changes=True)
     except GitError as exc:
         return Result(branch.name, "skipped", str(exc))
     ahead = int(repo.git("rev-list", "--count", f"{target}..{branch.oid}").stdout)
@@ -251,7 +277,7 @@ def _mirror_branch(repo: Repo, branch: Branch, fetched: FetchReport, dry_run: bo
     if dry_run:
         suffix = "; saves old tip before replacement" if ahead else ""
         return Result(branch.name, "would-mirror", detail + suffix)
-    backup = _replace(repo, branch, target, save=ahead > 0, reason="mirror")
+    backup = _replace(repo, branch, target, save=ahead > 0, reason="mirror", preserve_changes=True)
     return Result(branch.name, "mirrored", detail, backup)
 
 

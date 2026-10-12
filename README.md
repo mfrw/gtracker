@@ -103,7 +103,13 @@ Only commits reported by that remote's successful fetch can supply an update. Br
 
 Per-remote progress and native Git transfer output appear live on stderr. Results and backup refs appear on stdout, followed by updated, unchanged, skipped, and failed totals. Dry runs also count previewed changes; failed fetches, partial failures, and interruptions are labelled separately from successful completion.
 
-Unchecked-out branches use expected-old-OID ref transactions. A non-fast-forward branch replacement and its backup are committed together. Checked-out branches are updated in their existing worktrees with `git reset --keep`; no checkout loop is needed. A dirty or locked affected worktree is skipped. A missing upstream is reported without deleting its local branch.
+Unchecked-out branches use expected-old-OID ref transactions. A non-fast-forward branch replacement and its backup are committed together. Clean checked-out branches are updated in their existing worktrees with `git reset --keep`; no checkout loop is needed. A missing upstream is reported without deleting its local branch.
+
+**Dirty checkouts can update in mirror mode without stashing.** Git first checks whether local changes can be carried forward without overwriting them. A preserving checkout then advances the same branch while keeping staged changes, unstaged edits, and untracked files; clean paths receive the upstream version. This also works in linked worktrees and when upstream history was rewritten. Branch names and upstream configuration stay unchanged. A local change already present upstream may stop appearing as a local diff.
+
+Updates that would overwrite local work or ignored files are skipped, not force-applied; other eligible branches continue. Locked worktrees, existing checkout/ref locks, unresolved conflicts, unsafe index flags, and dirty or locally changed submodules remain protected. The preserving checkout runs Git's normal `post-checkout` hook; a hook failure can be reported after the branch has moved. Inspect the results and saved-tip backup before retrying; no automatic rollback or stash is attempted.
+
+Dirty-checkout preservation applies to default mirror sync only. `pull --rebase`, `sync --strategy rebase`, and `restore` still require clean affected worktrees.
 
 **Dry runs fetch.** `sync --dry-run` updates remote-tracking refs and can prune deleted remote refs, but does not change local branch tips, working files, or backup refs. It reports the planned local updates and safety skips.
 

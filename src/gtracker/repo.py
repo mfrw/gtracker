@@ -416,7 +416,7 @@ class Repo:
             if operation:
                 raise GitError(f"Git operation in progress at {tree.path}: {operation}")
 
-    def ensure_clean(self, target: str | None = None) -> None:
+    def _checked_status(self) -> str:
         operation = self.operation()
         if operation:
             raise GitError(f"Git operation in progress at {self.path}: {operation}")
@@ -426,12 +426,41 @@ class Repo:
         entries = self.git("ls-files", "-v", "-z").stdout.split("\0")
         if any(entry and (entry[0].islower() or entry[0] == "S") for entry in entries):
             raise GitError(f"Worktree uses assume-unchanged/skip-worktree index flags: {self.path}")
-        if self.git(
-            "status", "--porcelain", "-z", "--untracked-files=normal", "--ignore-submodules=none"
-        ).stdout:
+        return self.git(
+            "status",
+            "--porcelain=v2",
+            "--no-renames",
+            "-z",
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
+        ).stdout
+
+    def ensure_clean(self, target: str | None = None) -> None:
+        if self._checked_status():
             raise GitError(f"Worktree has uncommitted or untracked changes: {self.path}")
         if target:
             self._protect_ignored(target)
+
+    def ensure_preservable(self, target: str) -> bool:
+        """Check an edit-preserving checkout and report whether local changes exist."""
+        status = self._checked_status()
+        self._protect_ignored(target)
+        if not status:
+            return False
+        for row in status.split("\0"):
+            if row.startswith(("1 ", "u ")):
+                fields = row.split(" ", 8)
+                if fields[0] == "u":
+                    raise GitError(f"Worktree has unresolved conflicts: {self.path}")
+                if fields[2].startswith("S") or "160000" in fields[3:6]:
+                    raise GitError(f"Worktree has dirty or changed submodules: {self.path}")
+        for ref in ("HEAD", self.current_branch()):
+            if ref is not None:
+                lock = self.git_path(f"{ref}.lock")
+                if lock.exists() or lock.is_symlink():
+                    raise GitError(f"Checkout ref is locked: {lock}")
+        self.git("read-tree", "--dry-run", "-m", "-u", "HEAD", target)
+        return True
 
     def _protect_ignored(self, target: str) -> None:
         paths = self.git(

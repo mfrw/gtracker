@@ -37,15 +37,15 @@ def test_ahead_tracking_tip_is_backed_up_before_replacement(sandbox: Sandbox) ->
     assert tuple(backup.oid for backup in list_backups(repo)) == (ahead,)
 
 
-def test_dirty_tracking_tree_is_skipped_without_backup_or_file_changes(sandbox: Sandbox) -> None:
-    original = sandbox.git("rev-parse", "HEAD").stdout.strip()
+def test_dirty_tracking_tree_updates_without_changing_local_files(sandbox: Sandbox) -> None:
     (sandbox.repo / "base.txt").write_text("uncommitted work")
-    sandbox.commit("new.txt", "remote", path=sandbox.remote)
+    target = sandbox.commit("new.txt", "remote", path=sandbox.remote)
     repo = Repo.open(sandbox.repo)
     results = sync_mirror(repo)
-    assert results[0].action == "skipped"
-    assert sandbox.git("rev-parse", "HEAD").stdout.strip() == original
+    assert results[0].action == "mirrored"
+    assert sandbox.git("rev-parse", "HEAD").stdout.strip() == target
     assert (sandbox.repo / "base.txt").read_text() == "uncommitted work"
+    assert (sandbox.repo / "new.txt").read_text() == "remote"
     assert list_backups(repo) == ()
 
 

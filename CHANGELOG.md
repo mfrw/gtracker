@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Allow safe dirty-checkout mirroring without stashing, preserving staged, unstaged, and untracked work across normal and rewritten upstream updates; protect overlapping paths, checkout locks, and local submodule changes.
 - Add explicit offline backup cleanup with per-branch `--keep N` retention or `--all`, exact branch filters, mandatory preview/confirmation, transactional expected-OID deletion, and worktree/symbolic-ref safeguards.
 - Synchronize only upstream commits actually reported by successful fetches; preserve branches excluded by remote skip settings or negative refspecs, including overlapping fetch destinations.
 - Preserve completed results and backup refs on Ctrl-C, stop Git and hook process groups before safe checkout restoration, and retain active or dirty recovery state without discarding work.
